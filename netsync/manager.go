@@ -366,8 +366,12 @@ func (sm *SyncManager) startSync() {
 			log.Infof("Downloading headers for blocks %d to "+
 				"%d from peer %s", best.Height+1,
 				sm.nextCheckpoint.Height, bestPeer.Addr())
-		} else {
+		} else if !sm.current() {
+			// As long as we are not already current (fully synced with out peers),
+			// ask for an inv message to learn about blocks following our latest
+			// known tip of the main (best) chain.
 			bestPeer.PushGetBlocksMsg(locator, &zeroHash)
+			log.Debugf("We are not yet fully synced, so sending getblocks message to bestPeer %s", bestPeer)
 		}
 		sm.syncPeer = bestPeer
 
@@ -421,6 +425,12 @@ func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
 // be considered as a sync peer (they have already successfully negotiated).  It
 // also starts syncing if needed.  It is invoked from the syncHandler goroutine.
 func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
+	// Ignore if peer is disconnected
+	if !peer.Connected() {
+		log.Debugf("handleNewPeerMsg called for DISCONNECTED peer %s", peer)
+		return
+	}
+
 	// Ignore if in the process of shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		return
@@ -659,6 +669,10 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		return
 	}
 
+	if peer == sm.syncPeer {
+		log.Debugf("Processing block message received from syncPeer %s", peer)
+	}
+
 	// If we didn't ask for this block then the peer is misbehaving.
 	blockHash := bmsg.block.Hash()
 	if _, exists = state.requestedBlocks[*blockHash]; !exists {
@@ -772,6 +786,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 			log.Warnf("Failed to get block locator for the "+
 				"latest block: %v", err)
 		} else {
+			log.Debugf("Received orphan block from peer %s, requesting parents, orphanRoot: %s", peer, orphanRoot)
 			peer.PushGetBlocksMsg(locator, orphanRoot)
 		}
 	} else {
@@ -1187,11 +1202,31 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 				}
 			}
 
-			// Ignore invs block invs from non-witness enabled
+			/*// Ignore invs block invs from non-witness enabled
 			// peers, as after segwit activation we only want to
 			// download from peers that can provide us full witness
 			// data for blocks.
 			if !peer.IsWitnessEnabled() && iv.Type == wire.InvTypeBlock {
+				continue
+			}*/
+
+			// Once the segwit soft-fork package has activated, we only
+			// want to sync from peers which are witness enabled to ensure
+			// that we fully validate all blockchain data.
+			segwitActive, err := sm.chain.IsDeploymentActive(chaincfg.DeploymentSegwit)
+			if err != nil {
+				log.Errorf("Unable to query for segwit soft-fork state: %v", err)
+				return
+			}
+			if segwitActive && !peer.IsWitnessEnabled() && iv.Type == wire.InvTypeBlock {
+				log.Debugf("Ignoring block inventory vector from peer %s that is not"+
+					"enabled to support segregated witness BIP141 (non-segwit).", peer)
+				// Segregated witness has been activated, and this syncPeer is not signalling support, so select
+				// a new syncPeer.
+				// [Policy consideration]: Should we instead disconnect this non-segwit syncPeer?
+				if peer == sm.syncPeer {
+					sm.updateSyncPeer(false)
+				}
 				continue
 			}
 
@@ -1475,6 +1510,11 @@ func (sm *SyncManager) handleBlockchainNotification(notification *blockchain.Not
 
 // NewPeer informs the sync manager of a newly active peer.
 func (sm *SyncManager) NewPeer(peer *peerpkg.Peer) {
+	// Ignore if peer is not connected.
+	if !peer.Connected() {
+		log.Debugf("NewPeer called for disconnected peer %s.  Ignoring request.", peer)
+		return
+	}
 	// Ignore if we are shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		return
